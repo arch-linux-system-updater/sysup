@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Syntax
+        run: bash -n sysup && bash -n completions/sysup.bash
+      - name: ShellCheck
+        run: shellcheck -S warning sysup completions/sysup.bash
+
+  arch:
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: pacman -Syu --noconfirm --needed pacman-contrib make
+      - name: Smoke test
+        run: |
+          ./sysup --version
+          ./sysup --list-steps
+          ./sysup --help >/dev/null
+      - name: Install with make
+        run: make DESTDIR="$PWD/out" install && test -x out/usr/bin/sysup

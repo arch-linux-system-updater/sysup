@@ -1,0 +1,112 @@
+.TH SYSUP 1 "2026-11-04" "sysup 1.0.0" "User Commands"
+.SH NAME
+sysup \- update and tidy up an entire Arch Linux system with one command
+.SH SYNOPSIS
+.B sysup
+[\fIoptions\fR]
+.SH DESCRIPTION
+.B sysup
+updates everything on an Arch Linux system and then cleans up after itself.
+It finds what is installed and runs only what applies:
+.IP \(bu 2
+shows Arch news posted since your last upgrade, so you see manual interventions first
+.IP \(bu 2
+refreshes old mirrorlists (reflector or rate-mirrors), updates archlinux-keyring first
+.IP \(bu 2
+runs a full repo + AUR upgrade with paru, yay, pikaur or trizen (or plain pacman)
+.IP \(bu 2
+updates Flatpak, Snap, firmware (fwupd), developer toolchains (rustup, cargo, pipx,
+uv, npm, bun, deno, gh extensions, tldr), shell and editor plugins (oh\-my\-zsh,
+fisher, tpm, lazy.nvim) and dotfile frameworks (Caelestia)
+.IP \(bu 2
+removes orphans, trims the pacman and AUR build caches, vacuums the journal and
+deletes stale thumbnails; with \fB\-\-deep\fR also language caches, dangling
+container images, old coredumps and old trash
+.IP \(bu 2
+reports .pacnew files, failed services, packages needing a rebuild and whether a
+reboot is needed
+.PP
+Run it as your normal user. It asks for your sudo password once and keeps it
+alive for the whole run.
+.SH OPTIONS
+.TP
+.BR \-y ", " \-\-yes
+Never ask questions; pass \-\-noconfirm to everything.
+.TP
+.BR \-n ", " \-\-dry\-run
+Show every command that would run without changing anything.
+.TP
+.BR \-c ", " \-\-check
+List available repo, AUR and Flatpak updates, then exit.
+.TP
+.BR \-d ", " \-\-deep
+Also do a deep clean.
+.TP
+.B \-\-devel
+Also rebuild \-git/VCS AUR packages.
+.TP
+.B \-\-no\-clean
+Skip the cleanup step.
+.TP
+.BI \-\-only " STEPS"
+Run only these steps (comma separated).
+.TP
+.BI \-\-skip " STEPS"
+Skip these steps (comma separated).
+.TP
+.BI \-\-helper " NAME"
+Use this AUR helper: paru, yay, pikaur, trizen or pacman.
+.TP
+.BR \-l ", " \-\-list\-steps
+List all steps with a description.
+.TP
+.BI \-\-config " FILE"
+Read an extra config file after the default ones.
+.TP
+.B \-\-edit\-config
+Open your per\-user config in \fB$VISUAL\fR/\fB$EDITOR\fR, creating it if needed.
+.TP
+.B \-\-no\-color
+Disable colours (the \fBNO_COLOR\fR environment variable works too).
+.TP
+.BR \-h ", " \-\-help
+Show help.
+.TP
+.BR \-V ", " \-\-version
+Show the version.
+.SH STEPS
+news, mirrors, keyring, packages, flatpak, snap, firmware, devtools, plugins,
+dotfiles, extra, clean, checks
+.SH FILES
+.TP
+.I /etc/sysup.conf
+System\-wide configuration. Every option is documented in it.
+.TP
+.I ~/.config/sysup/sysup.conf
+Per\-user configuration, read after the system file.
+.TP
+.I ~/.config/sysup/hooks.d/
+Executable scripts here are run during the \fBextra\fR step.
+.TP
+.I ~/.local/state/sysup/history.log
+One line per run with the result of each step.
+.SH EXIT STATUS
+0 on success, 1 if any step failed, 130 when interrupted.
+.SH EXAMPLES
+.TP
+.B sysup
+Update and clean everything, asking before risky steps.
+.TP
+.B sysup \-yd
+Unattended run with deep clean.
+.TP
+.B sysup \-\-only clean \-d
+Only free up disk space.
+.SH SEE ALSO
+.BR pacman (8),
+.BR paru (8),
+.BR yay (8),
+.BR paccache (8),
+.BR pacdiff (8),
+.BR flatpak (1),
+.BR fwupdmgr (1)

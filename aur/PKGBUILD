@@ -1,0 +1,29 @@
+# Maintainer: mir4ozzz <mirowrc3 at gmail dot com>
+
+pkgname=sysup
+pkgver=1.0.0
+pkgrel=1
+pkgdesc="One command to update and tidy up your whole Arch system: pacman, AUR, Flatpak, firmware, dev tools, dotfiles, junk cleanup"
+arch=('any')
+url="https://github.com/arch-linux-system-updater/sysup"
+license=('MIT')
+depends=('bash' 'pacman' 'pacman-contrib' 'curl' 'coreutils' 'util-linux' 'findutils' 'grep' 'sed' 'gawk' 'procps-ng' 'systemd')
+optdepends=(
+    'sudo: run system-wide steps as a normal user (or doas / run0)'
+    'paru: AUR updates (recommended)'
+    'yay: AUR updates'
+    'flatpak: update Flatpak apps'
+    'fwupd: firmware updates'
+    'reflector: keep the mirrorlist fresh'
+    'rate-mirrors: keep the mirrorlist fresh (faster alternative to reflector)'
+    'rebuild-detector: find AUR packages that need a rebuild after library updates'
+)
+backup=('etc/sysup.conf')
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+# real checksum is filled in by `make aur` once the v$pkgver tag is on GitHub
+sha256sums=('SKIP')
+
+package() {
+    cd "$pkgname-$pkgver"
+    make DESTDIR="$pkgdir" PREFIX=/usr install
+}

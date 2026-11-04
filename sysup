@@ -1,0 +1,1028 @@
+#!/usr/bin/env bash
+#
+# sysup — update and tidy up an entire Arch Linux system with one command.
+#
+#   repo + AUR packages · Flatpak · Snap · firmware · dev toolchains
+#   shell/editor plugins · dotfile frameworks · junk cleanup · health checks
+#
+# SPDX-License-Identifier: MIT
+
+set -uo pipefail
+shopt -s nullglob extglob
+
+SYSUP_VERSION="1.0.0"
+PROG=${0##*/}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Defaults — every one of these can be overridden in /etc/sysup.conf or
+# ~/.config/sysup/sysup.conf (run `sysup --edit-config`).
+# ─────────────────────────────────────────────────────────────────────────────
+AUR_HELPER=auto          # auto | paru | yay | pikaur | trizen | pacman
+SUDO=auto                # auto | sudo | doas | run0
+NOCONFIRM=no             # yes = never ask, pass --noconfirm everywhere
+DEVEL=no                 # also rebuild -git/VCS AUR packages (--devel)
+NEWS=yes                 # show Arch news published since your last upgrade
+MIRRORS=auto             # auto (only if mirrorlist is old) | yes | no
+MIRROR_MAX_AGE=14        # days
+KEYRING=yes              # update archlinux-keyring before everything else
+FLATPAK=yes
+SNAP=yes
+FIRMWARE=check           # check (report only) | yes (install) | no
+DEVTOOLS=yes             # rustup, cargo, pipx, uv, npm, gh extensions, tldr...
+PLUGINS=yes              # oh-my-zsh, fisher, tmux tpm, lazy.nvim
+DOTFILES=yes             # caelestia, ...
+CLEAN=yes
+ORPHANS=ask              # ask | yes | no
+PKG_CACHE_KEEP=2         # versions of each installed package to keep in cache
+PKG_CACHE_KEEP_UNINSTALLED=0
+AUR_CACHE=yes            # prune paru/yay build caches
+JOURNAL_MAX_SIZE=500M
+JOURNAL_MAX_AGE=4weeks
+THUMBNAIL_MAX_AGE=30     # days
+DEEP_CLEAN=no            # language caches, docker dangling images, old trash...
+TRASH_MAX_AGE=30         # days (deep clean only)
+COREDUMP_MAX_AGE=7       # days (deep clean only)
+CHECKS=yes               # .pacnew, failed units, reboot needed, tips
+EXTRA_COMMANDS=()        # your own commands, run after everything else
+SKIP_STEPS=()            # steps to always skip, e.g. (snap firmware)
+
+SYSTEM_CONF=/etc/sysup.conf
+CONFIG_DIR=${XDG_CONFIG_HOME:-$HOME/.config}/sysup
+USER_CONF=$CONFIG_DIR/sysup.conf
+STATE_DIR=${XDG_STATE_HOME:-$HOME/.local/state}/sysup
+
+STEPS=(news mirrors keyring packages flatpak snap firmware devtools plugins dotfiles extra clean checks)
+declare -A STEP_TITLE=(
+    [news]="Arch news"            [mirrors]="Mirrors"
+    [keyring]="Keyring"           [packages]="System packages"
+    [flatpak]="Flatpak"           [snap]="Snap"
+    [firmware]="Firmware"         [devtools]="Developer tools"
+    [plugins]="Shell & editor plugins"
+    [dotfiles]="Dotfiles & desktop"
+    [extra]="Custom commands"     [clean]="Cleanup"
+    [checks]="Health checks"
+)
+declare -A STEP_DESC=(
+    [news]="show Arch news posted since your last upgrade (manual interventions!)"
+    [mirrors]="refresh the mirrorlist with reflector or rate-mirrors when it gets old"
+    [keyring]="update archlinux-keyring first so new signatures verify"
+    [packages]="full repo + AUR upgrade (paru/yay/pikaur/trizen, or pacman)"
+    [flatpak]="update Flatpak apps and remove unused runtimes"
+    [snap]="refresh Snap packages"
+    [firmware]="check (or install) firmware updates via fwupd"
+    [devtools]="rustup, cargo install-update, pipx, uv tools, npm globals, gh extensions, tldr"
+    [plugins]="oh-my-zsh, fisher, tmux tpm, lazy.nvim"
+    [dotfiles]="dotfile/desktop frameworks such as Caelestia"
+    [extra]="EXTRA_COMMANDS from your config and ~/.config/sysup/hooks.d/*"
+    [clean]="orphans, package cache, AUR build cache, journal, thumbnails (+ --deep)"
+    [checks]=".pacnew files, failed services, reboot needed, optimisation tips"
+)
+# config variable that turns each step on/off
+declare -A STEP_VAR=(
+    [news]=NEWS [mirrors]=MIRRORS [keyring]=KEYRING [flatpak]=FLATPAK
+    [snap]=SNAP [firmware]=FIRMWARE [devtools]=DEVTOOLS [plugins]=PLUGINS
+    [dotfiles]=DOTFILES [clean]=CLEAN [checks]=CHECKS
+)
+
+declare -A STATUS=() NOTE=() STARTED=() OPT=()
+ONLY=() TASK_OK=() TASK_FAIL=() NEED_REBOOT=() TIPS=()
+REPO_UPDATES=() AUR_UPDATES=() FLATPAK_UPDATES=()
+REPO_KNOWN=0 PKG_OK=1 DRY_RUN=0 CHECK_ONLY=0 LIST_STEPS=0 EDIT_CONFIG=0
+CUR="" HELPER="" SUDO_CMD=() KEEPALIVE_PID="" LOG_START=0 LAST_UPGRADE=""
+CLI_CONFIG="" USE_COLOR=auto
+PACMAN_LOG=/var/log/pacman.log
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Output
+# ─────────────────────────────────────────────────────────────────────────────
+setup_ui() {
+    if [[ -t 1 && -z ${NO_COLOR-} && $USE_COLOR != no ]]; then
+        R=$'\e[0m' B=$'\e[1m' D=$'\e[2m'
+        RED=$'\e[31m' GRN=$'\e[32m' YLW=$'\e[33m' BLU=$'\e[34m' MAG=$'\e[35m' CYN=$'\e[36m'
+    else
+        R='' B='' D='' RED='' GRN='' YLW='' BLU='' MAG='' CYN=''
+    fi
+    if [[ ${LC_ALL:-${LC_CTYPE:-${LANG:-}}} == *[Uu][Tt][Ff]?(-)8* ]]; then
+        I_OK='✓' I_FAIL='✗' I_WARN='!' I_SKIP='–' I_DOT='•' I_ARR='→' LINE='─'
+    else
+        I_OK='+' I_FAIL='x' I_WARN='!' I_SKIP='-' I_DOT='*' I_ARR='->' LINE='-'
+    fi
+}
+
+info() { printf '  %s->%s %s\n' "$CYN$B" "$R" "$*"; }
+good() { printf '  %s%s%s %s\n' "$GRN$B" "$I_OK" "$R" "$*"; }
+warn() { printf '  %s%s%s %s\n' "$YLW$B" "$I_WARN" "$R" "$*" >&2; }
+err()  { printf '  %s%s%s %s\n' "$RED$B" "$I_FAIL" "$R" "$*" >&2; }
+die()  { printf '%s%s:%s %s\n' "$RED$B" "$PROG" "$R" "$*" >&2; exit 1; }
+rule() { local l; printf -v l '%*s' 52 ''; printf '%s\n' "${l// /$LINE}"; }
+
+# Print the step header (once) the first time a step actually does something.
+begin() {
+    [[ -n ${STARTED[$CUR]-} ]] && return 0
+    STARTED[$CUR]=1
+    printf '\n%s==>%s %s%s%s' "$BLU$B" "$R" "$B" "${STEP_TITLE[$CUR]}" "$R"
+    [[ -n ${1-} ]] && printf '  %s%s%s' "$D" "$1" "$R"
+    printf '\n'
+}
+
+result() { STATUS[$CUR]=$1; NOTE[$CUR]=${2-}; }
+
+quote() {
+    local a out='' safe='^[][A-Za-z0-9_./:=@%+,~^-]+$'
+    for a; do
+        if [[ $a =~ $safe ]]; then out+="$a "; else out+="$(printf '%q' "$a") "; fi
+    done
+    printf '%s' "${out% }"
+}
+
+# run CMD...   — show the command, then run it (or only show it with --dry-run)
+run() {
+    printf '  %s$ %s%s\n' "$D" "$(quote "$@")" "$R"
+    (( DRY_RUN )) && return 0
+    "$@" 9>&-
+}
+
+# root CMD...  — same as run, with sudo/doas/run0 when not already root
+root() { run "${SUDO_CMD[@]}" "$@"; }
+
+# task LABEL CMD... — one item inside a step; its outcome is remembered
+task() {
+    local label=$1; shift
+    begin
+    printf '  %s%s%s %s%s%s\n' "$MAG$B" "$I_DOT" "$R" "$B" "$label" "$R"
+    if "$@"; then
+        TASK_OK+=("$label")
+    else
+        TASK_FAIL+=("$label")
+        err "$label failed"
+    fi
+}
+tasks_reset() { TASK_OK=(); TASK_FAIL=(); }
+tasks_result() {
+    local prefix=${1-} note
+    if (( ${#TASK_FAIL[@]} )); then
+        note="${#TASK_OK[@]} ok, failed: $(join ', ' "${TASK_FAIL[@]}")"
+        result fail "${prefix:+$prefix; }$note"
+    elif [[ -n $prefix ]]; then
+        result ok "$prefix"
+    elif (( ${#TASK_OK[@]} > 3 )); then
+        result ok "${#TASK_OK[@]} updated"
+    elif (( ${#TASK_OK[@]} )); then
+        result ok "$(join ', ' "${TASK_OK[@]}")"
+    fi
+}
+
+confirm() { # confirm QUESTION [y|n]
+    local q=$1 def=${2:-y} ans hint
+    if is_yes "$NOCONFIRM" || (( DRY_RUN )); then return 0; fi
+    if [[ ! -t 0 ]]; then [[ $def == y ]]; return; fi
+    [[ $def == y ]] && hint="[Y/n]" || hint="[y/N]"
+    printf '  %s?%s %s %s ' "$YLW$B" "$R" "$q" "$hint"
+    read -r ans || ans=''
+    ans=${ans,,}
+    [[ -z $ans ]] && ans=$def
+    [[ $ans == y* ]]
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────────────────────────────────────
+have()   { command -v "$1" >/dev/null 2>&1; }
+is_yes() { [[ ${1,,} == @(y|yes|true|1|on) ]]; }
+join()   { local sep=$1; shift; local out='' x; for x; do out+="${out:+$sep}$x"; done; printf '%s' "$out"; }
+
+human() {
+    local n=${1:-0}
+    if (( n < 1024 )); then printf '%d B' "$n"; else numfmt --to=iec-i --suffix=B --format='%.1f' "$n"; fi
+}
+duration() { local s=$1; (( s >= 60 )) && printf '%dm %ds' $((s / 60)) $((s % 60)) || printf '%ds' "$s"; }
+
+# bytes used on the filesystems holding /, /home and /var (each counted once)
+disk_used() {
+    df -B1 --output=used,target / /home /var 2>/dev/null | awk 'NR > 1 && !seen[$2]++ { s += $1 } END { print s + 0 }'
+}
+
+log_since_start() { [[ -r $PACMAN_LOG ]] && tail -n +"$((LOG_START + 1))" "$PACMAN_LOG"; }
+
+changes_summary() {
+    log_since_start | awk '
+        $2 == "[ALPM]" && $3 ~ /^(upgraded|installed|downgraded|removed)$/ { c[$3]++ }
+        END {
+            n = split("upgraded installed downgraded removed", o, " ")
+            for (i = 1; i <= n; i++) if (c[o[i]]) s = s (s ? ", " : "") c[o[i]] " " o[i]
+            print s
+        }'
+}
+
+changed_packages() { log_since_start | awk '$2 == "[ALPM]" && ($3 == "upgraded" || $3 == "installed") { print $4 }'; }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Setup
+# ─────────────────────────────────────────────────────────────────────────────
+usage() {
+    cat <<EOF
+${B}sysup${R} $SYSUP_VERSION — update and tidy up your whole Arch Linux system
+
+${B}Usage:${R} $PROG [options]
+
+${B}Options:${R}
+  -y, --yes            never ask, pass --noconfirm to everything
+  -n, --dry-run        show what would run, change nothing
+  -c, --check          only list available updates, then exit
+  -d, --deep           deep clean: language caches, docker, old trash, coredumps
+      --devel          also rebuild -git/VCS AUR packages
+      --no-clean       skip the cleanup step
+      --only STEPS     run only these steps (comma separated)
+      --skip STEPS     skip these steps (comma separated)
+      --helper NAME    force an AUR helper: paru, yay, pikaur, trizen, pacman
+  -l, --list-steps     list all steps and exit
+      --config FILE    read an extra config file
+      --edit-config    open your config file in \$EDITOR
+      --no-color       disable colours
+  -h, --help           show this help
+  -V, --version        show the version
+
+${B}Steps:${R} ${STEPS[*]}
+
+${B}Examples:${R}
+  $PROG                    update + clean everything, asking before risky bits
+  $PROG -y                 fully unattended
+  $PROG -yd                unattended, with deep clean
+  $PROG --only clean -d    just free up disk space
+  $PROG --skip devtools,plugins
+
+Config: $SYSTEM_CONF, $USER_CONF
+EOF
+}
+
+list_steps() {
+    local s
+    for s in "${STEPS[@]}"; do printf '  %s%-10s%s %s\n' "$B" "$s" "$R" "${STEP_DESC[$s]}"; done
+}
+
+parse_steps() { # parse_steps "a,b" ARRAYNAME
+    local -n _arr=$2
+    local s v
+    IFS=', ' read -ra _arr <<<"$1"
+    for s in "${_arr[@]}"; do
+        for v in "${STEPS[@]}"; do [[ $s == "$v" ]] && continue 2; done
+        die "unknown step '$s' (see: $PROG --list-steps)"
+    done
+}
+
+parse_args() {
+    local -a args=()
+    local a i
+    # split bundled short options: -yd -> -y -d
+    for a in "$@"; do
+        if [[ $a =~ ^-[a-zA-Z]{2,}$ ]]; then
+            for (( i = 1; i < ${#a}; i++ )); do args+=("-${a:i:1}"); done
+        else
+            args+=("$a")
+        fi
+    done
+    set -- "${args[@]}"
+
+    while (( $# )); do
+        case $1 in
+            -y|--yes|--noconfirm) OPT[NOCONFIRM]=yes ;;
+            -n|--dry-run)         DRY_RUN=1 ;;
+            -c|--check)           CHECK_ONLY=1 ;;
+            -d|--deep)            OPT[DEEP_CLEAN]=yes ;;
+            --devel)              OPT[DEVEL]=yes ;;
+            --no-clean)           OPT[CLEAN]=no ;;
+            --only)               [[ $# -ge 2 ]] || die "--only needs a value"; parse_steps "$2" ONLY; shift ;;
+            --only=*)             parse_steps "${1#*=}" ONLY ;;
+            --skip)               [[ $# -ge 2 ]] || die "--skip needs a value"; parse_steps "$2" CLI_SKIP; shift ;;
+            --skip=*)             parse_steps "${1#*=}" CLI_SKIP ;;
+            --helper)             [[ $# -ge 2 ]] || die "--helper needs a value"; OPT[AUR_HELPER]=$2; shift ;;
+            --helper=*)           OPT[AUR_HELPER]=${1#*=} ;;
+            --config)             [[ $# -ge 2 ]] || die "--config needs a value"; CLI_CONFIG=$2; shift ;;
+            --config=*)           CLI_CONFIG=${1#*=} ;;
+            --edit-config)        EDIT_CONFIG=1 ;;
+            -l|--list-steps)      LIST_STEPS=1 ;;
+            --no-color|--no-colour) USE_COLOR=no ;;
+            -h|--help)            setup_ui; usage; exit 0 ;;
+            -V|--version)         printf 'sysup %s\n' "$SYSUP_VERSION"; exit 0 ;;
+            *)                    die "unknown option '$1' (see: $PROG --help)" ;;
+        esac
+        shift
+    done
+}
+
+load_config() {
+    local f
+    for f in "$SYSTEM_CONF" "$USER_CONF" ${CLI_CONFIG:+"$CLI_CONFIG"}; do
+        [[ -f $f ]] || { [[ $f == "$CLI_CONFIG" ]] && die "config file not found: $f"; continue; }
+        # shellcheck source=/dev/null
+        source "$f" || die "error in config file $f"
+    done
+    # command-line options win over config files
+    for f in "${!OPT[@]}"; do printf -v "$f" '%s' "${OPT[$f]}"; done
+    SKIP_STEPS+=("${CLI_SKIP[@]}")
+    # --only X means "I really want X": switch its toggle on
+    for f in "${ONLY[@]}"; do
+        [[ -n ${STEP_VAR[$f]-} ]] || continue
+        case ${STEP_VAR[$f]} in
+            MIRRORS) MIRRORS=yes ;;
+            FIRMWARE) [[ ${FIRMWARE,,} == no ]] && FIRMWARE=check ;;
+            *) printf -v "${STEP_VAR[$f]}" yes ;;
+        esac
+    done
+    [[ $PKG_CACHE_KEEP =~ ^[0-9]+$ ]] || die "PKG_CACHE_KEEP must be a number"
+    [[ $PKG_CACHE_KEEP_UNINSTALLED =~ ^[0-9]+$ ]] || die "PKG_CACHE_KEEP_UNINSTALLED must be a number"
+}
+
+edit_config() {
+    local editor
+    if [[ ! -f $USER_CONF ]]; then
+        mkdir -p "$CONFIG_DIR" || die "cannot create $CONFIG_DIR"
+        if [[ -f $SYSTEM_CONF ]]; then cp "$SYSTEM_CONF" "$USER_CONF"; else : >"$USER_CONF"; fi
+        info "created $USER_CONF"
+    fi
+    editor=${VISUAL:-${EDITOR:-}}
+    if [[ -z $editor ]]; then
+        for editor in nano nvim vim vi; do have "$editor" && break; done
+    fi
+    # shellcheck disable=SC2086 # $editor may contain flags, e.g. "code -w"
+    exec $editor "$USER_CONF"
+}
+
+step_selected() {
+    local s=$1 x
+    if (( ${#ONLY[@]} )); then
+        for x in "${ONLY[@]}"; do [[ $x == "$s" ]] && return 0; done
+        return 1
+    fi
+    for x in "${SKIP_STEPS[@]}"; do [[ $x == "$s" ]] && return 1; done
+    return 0
+}
+
+detect_sudo() {
+    if (( EUID == 0 )); then SUDO_CMD=(); return; fi
+    local s=${SUDO,,}
+    if [[ $s == auto ]]; then
+        for s in sudo doas run0; do have "$s" && break; done
+    fi
+    have "$s" || die "need sudo, doas or run0 to update the system (or set SUDO= in $USER_CONF)"
+    SUDO_CMD=("$s")
+}
+
+detect_helper() {
+    if (( EUID == 0 )); then HELPER=pacman; return; fi
+    local h=${AUR_HELPER,,}
+    if [[ $h == auto ]]; then
+        for h in paru yay pikaur trizen pacman; do have "$h" && break; done
+    elif [[ $h != @(paru|yay|pikaur|trizen|pacman) ]]; then
+        die "unsupported AUR_HELPER '$AUR_HELPER' (paru, yay, pikaur, trizen, pacman)"
+    elif ! have "$h"; then
+        die "AUR_HELPER is '$h' but it is not installed"
+    fi
+    HELPER=$h
+}
+
+sudo_start() {
+    (( EUID == 0 || DRY_RUN )) && return 0
+    [[ ${SUDO_CMD[0]} == sudo ]] || return 0   # doas/run0 handle this themselves
+    info "Some steps need root — asking for your password once."
+    sudo -v || die "sudo authentication failed"
+    ( while kill -0 "$$" 2>/dev/null; do sudo -n -v 2>/dev/null; sleep 50; done ) >/dev/null 2>&1 9>&- &
+    KEEPALIVE_PID=$!
+}
+
+on_exit() { [[ -n $KEEPALIVE_PID ]] && kill "$KEEPALIVE_PID" 2>/dev/null; return 0; }
+on_interrupt() {
+    trap - INT TERM
+    printf '\n'
+    warn "Interrupted."
+    if [[ -n $CUR ]]; then STARTED[$CUR]=1; result fail "interrupted"; fi
+    summary
+    exit 130
+}
+
+preflight() {
+    have pacman || die "pacman not found — sysup is for Arch Linux and Arch-based distros"
+    PACMAN_LOG=$(pacman-conf LogFile 2>/dev/null) || PACMAN_LOG=/var/log/pacman.log
+    [[ -n $PACMAN_LOG ]] || PACMAN_LOG=/var/log/pacman.log
+
+    # only one sysup at a time
+    local lockfile=${XDG_RUNTIME_DIR:-/tmp}/sysup-$EUID.lock
+    exec 9>"$lockfile" && flock -n 9 || die "sysup is already running"
+
+    if (( EUID == 0 )); then
+        warn "Running as root: AUR, Flatpak user apps and per-user steps are skipped."
+        warn "Run sysup as your normal user instead — it asks for sudo when it needs it."
+    fi
+
+    # stale pacman lock
+    local lock
+    lock="$(pacman-conf DBPath 2>/dev/null || echo /var/lib/pacman/)"
+    lock="${lock%/}/db.lck"
+    if [[ -e $lock ]]; then
+        if pgrep -x 'pacman|paru|yay|pikaur|trizen|pamac|pamac-daemon|packagekitd' >/dev/null; then
+            die "another package manager is running ($lock exists) — let it finish first"
+        fi
+        warn "Found a stale pacman lock: $lock (no package manager is running)."
+        if confirm "Remove it?" y; then root rm -f "$lock" || die "could not remove $lock"
+        else die "pacman is locked — remove $lock and try again"; fi
+    fi
+
+    # an unmounted /boot during a kernel upgrade = unbootable system
+    local m
+    for m in /boot /efi /boot/efi; do
+        if findmnt --fstab -n "$m" >/dev/null 2>&1 && ! mountpoint -q "$m"; then
+            die "$m is in /etc/fstab but not mounted — a kernel update now could leave you unbootable. Mount it (sudo mount $m) and run sysup again."
+        fi
+    done
+
+    # disk space
+    local avail
+    avail=$(df -B1 --output=avail /var/cache/pacman/pkg 2>/dev/null | tail -n 1)
+    if [[ $avail =~ ^[0-9]+$ ]] && (( avail < 2 * 1024 ** 3 )); then
+        warn "Only $(human "$avail") free on the system disk."
+        if have paccache && confirm "Trim the package cache first to make room?" y; then
+            root paccache -rk1
+            root paccache -ruk0
+        fi
+    fi
+
+    # internet
+    if ! curl -fsS --head --max-time 10 -o /dev/null https://archlinux.org 2>/dev/null; then
+        local mirror
+        mirror=$(sed -nE 's/^[[:space:]]*Server[[:space:]]*=[[:space:]]*(https?:\/\/[^/$]+).*/\1/p' /etc/pacman.d/mirrorlist 2>/dev/null | head -n 1)
+        if [[ -z $mirror ]] || ! curl -fsS --head --max-time 10 -o /dev/null "$mirror" 2>/dev/null; then
+            (( DRY_RUN )) && warn "No internet connection." || die "no internet connection"
+        fi
+    fi
+
+    LOG_START=$( (wc -l <"$PACMAN_LOG") 2>/dev/null || echo 0)
+    LAST_UPGRADE=$(tac "$PACMAN_LOG" 2>/dev/null | grep -m1 -F '[PACMAN] starting full system upgrade' | sed -E 's/^\[([^]]+)\].*/\1/')
+}
+
+gather_updates() {
+    local out rc
+    REPO_UPDATES=() AUR_UPDATES=() FLATPAK_UPDATES=() REPO_KNOWN=0
+    [[ -t 1 ]] && printf '  %sChecking for updates…%s' "$D" "$R"
+    if have checkupdates; then
+        out=$(checkupdates 2>/dev/null); rc=$?
+        if (( rc == 0 || rc == 2 )); then
+            REPO_KNOWN=1
+            [[ -n $out ]] && mapfile -t REPO_UPDATES <<<"$out"
+        fi
+    fi
+    if [[ $HELPER == @(paru|yay) ]]; then
+        out=$("$HELPER" -Qua 2>/dev/null | grep -F -- '->')
+        [[ -n $out ]] && mapfile -t AUR_UPDATES <<<"$out"
+    fi
+    if is_yes "$FLATPAK" && have flatpak && (( EUID != 0 )); then
+        out=$(flatpak remote-ls --updates --columns=application 2>/dev/null)
+        [[ -n $out ]] && mapfile -t FLATPAK_UPDATES <<<"$out"
+    fi
+    [[ -t 1 ]] && printf '\r\e[K'
+}
+
+print_updates() {
+    local -a parts=()
+    (( REPO_KNOWN )) && parts+=("${#REPO_UPDATES[@]} repo")
+    [[ $HELPER == @(paru|yay) ]] && parts+=("${#AUR_UPDATES[@]} AUR")
+    (( ${#FLATPAK_UPDATES[@]} )) && parts+=("${#FLATPAK_UPDATES[@]} Flatpak")
+    (( ${#parts[@]} )) || return 0
+    if (( ${#REPO_UPDATES[@]} + ${#AUR_UPDATES[@]} + ${#FLATPAK_UPDATES[@]} == 0 )); then
+        good "Packages are already up to date."
+    else
+        info "Updates available: ${B}$(join ' · ' "${parts[@]}")${R}"
+    fi
+}
+
+banner() {
+    local distro kernel
+    distro=$(. /etc/os-release 2>/dev/null && printf '%s' "${PRETTY_NAME:-${NAME:-Linux}}")
+    kernel=$(uname -r)
+    printf '\n%s sysup %s%s  %s%s · %s · %s%s\n' "$BLU$B" "$SYSUP_VERSION" "$R" "$D" "${distro:-Arch Linux}" "$kernel" "$HELPER" "$R"
+    (( DRY_RUN )) && printf '  %s%sDRY RUN — nothing will be changed%s\n' "$YLW" "$B" "$R"
+    rule
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Steps
+# ─────────────────────────────────────────────────────────────────────────────
+step_news() {
+    is_yes "$NEWS" || return 0
+    begin "archlinux.org/news"
+    local feed since epoch title date
+    local -a items=()
+    if ! feed=$(curl -fsSL --max-time 15 https://archlinux.org/feeds/news/ 2>/dev/null); then
+        warn "Could not fetch the Arch news feed."
+        result warn "feed unreachable"; return 0
+    fi
+    since=''
+    [[ -n $LAST_UPGRADE ]] && since=$(date -d "$LAST_UPGRADE" +%s 2>/dev/null)
+    [[ -n $since ]] || since=$(( $(date +%s) - 30 * 86400 ))
+
+    while IFS=$'\t' read -r title date; do
+        epoch=$(date -d "$date" +%s 2>/dev/null) || continue
+        (( epoch > since )) || continue
+        title=${title//&amp;/&}; title=${title//&lt;/<}; title=${title//&gt;/>}
+        title=${title//&quot;/\"}; title=${title//&#39;/\'}; title=${title//&#x27;/\'}
+        items+=("$(date -d "@$epoch" +%F)  $title")
+    done < <(tr '\n' ' ' <<<"$feed" | sed 's:</item>:</item>\n:g' \
+             | sed -nE 's:.*<title>(.*)</title>.*<pubDate>(.*)</pubDate>.*:\1\t\2:p')
+
+    if (( ${#items[@]} == 0 )); then
+        good "No news since your last upgrade."
+        result ok "nothing new"; return 0
+    fi
+    warn "${#items[@]} news item(s) since your last upgrade — some may need manual action:"
+    local i
+    for i in "${items[@]}"; do printf '      %s%s%s\n' "$B" "$i" "$R"; done
+    info "Read them at https://archlinux.org/news/"
+    result warn "${#items[@]} new item(s) — read them"
+    if ! is_yes "$NOCONFIRM" && [[ -t 0 ]] && ! confirm "Continue with the update?" y; then
+        info "Stopped. Nothing was changed."
+        exit 0
+    fi
+}
+
+step_mirrors() {
+    local mode=${MIRRORS,,} ml=/etc/pacman.d/mirrorlist age
+    [[ $mode == no ]] && return 0
+    [[ -f $ml ]] || return 0
+    age=$(( ( $(date +%s) - $(stat -c %Y "$ml") ) / 86400 ))
+    if [[ $mode == auto ]] && (( age < MIRROR_MAX_AGE )); then return 0; fi
+
+    if have reflector; then
+        begin "mirrorlist is ${age} days old — reflector"
+        # uses your /etc/xdg/reflector/reflector.conf
+        if root systemctl start reflector.service; then result ok "refreshed with reflector"
+        else result fail "reflector.service failed (see: journalctl -u reflector)"; fi
+    elif have rate-mirrors; then
+        begin "mirrorlist is ${age} days old — rate-mirrors"
+        local tmp
+        tmp=$(mktemp) || { result fail "mktemp failed"; return 0; }
+        if run rate-mirrors --save="$tmp" arch && { (( DRY_RUN )) || grep -q '^Server' "$tmp"; }; then
+            root cp "$ml" "$ml.bak" && root install -m644 "$tmp" "$ml"
+            result ok "refreshed with rate-mirrors (backup: $ml.bak)"
+        else
+            result fail "rate-mirrors failed, mirrorlist untouched"
+        fi
+        rm -f "$tmp"
+    elif [[ $mode == yes ]]; then
+        begin
+        warn "Install reflector or rate-mirrors to refresh mirrors."
+        result warn "no mirror tool installed"
+    else
+        TIPS+=("Your mirrorlist is ${age} days old. Install ${B}reflector${R} or ${B}rate-mirrors${R} and sysup will keep it fresh.")
+    fi
+}
+
+step_keyring() {
+    is_yes "$KEYRING" || return 0
+    step_selected packages || return 0      # never leave a partial upgrade behind
+    (( REPO_KNOWN )) || return 0
+    printf '%s\n' "${REPO_UPDATES[@]}" | grep -q '^archlinux-keyring ' || return 0
+    begin "updated first so new package signatures verify"
+    if root pacman -Sy --needed --noconfirm archlinux-keyring; then result ok "archlinux-keyring updated"
+    else result fail "could not update archlinux-keyring"; fi
+}
+
+step_packages() {
+    begin "$HELPER"
+    local -a cmd
+    case $HELPER in
+        pacman) cmd=(pacman -Syu) ;;
+        trizen) cmd=(trizen -Syu) ;;
+        *)      cmd=("$HELPER" -Syu); is_yes "$DEVEL" && cmd+=(--devel) ;;
+    esac
+    is_yes "$NOCONFIRM" && cmd+=(--noconfirm)
+
+    local rc
+    if [[ $HELPER == pacman ]]; then root "${cmd[@]}"; else run "${cmd[@]}"; fi
+    rc=$?
+    if (( rc == 0 )); then
+        PKG_OK=1
+        local s; s=$(changes_summary)
+        (( DRY_RUN )) && s="dry run"
+        result ok "${s:-already up to date}"
+    else
+        PKG_OK=0
+        result fail "$HELPER exited with code $rc"
+    fi
+
+    if have pkgfile; then
+        root pkgfile --update >/dev/null || warn "pkgfile --update failed"
+    fi
+}
+
+step_flatpak() {
+    is_yes "$FLATPAK" || return 0
+    have flatpak || return 0
+    local sys usr
+    sys=$(flatpak list --system --columns=ref 2>/dev/null)
+    usr=''
+    (( EUID != 0 )) && usr=$(flatpak list --user --columns=ref 2>/dev/null)
+    [[ -n $sys$usr ]] || return 0
+
+    local -a y=()
+    is_yes "$NOCONFIRM" && y=(-y)
+    tasks_reset
+    [[ -n $sys ]] && task "system apps" root flatpak update --system "${y[@]}"
+    [[ -n $usr ]] && task "user apps"   run  flatpak update --user "${y[@]}"
+    if is_yes "$CLEAN"; then
+        [[ -n $sys ]] && task "unused system runtimes" root flatpak uninstall --system --unused -y
+        [[ -n $usr ]] && task "unused user runtimes"   run  flatpak uninstall --user --unused -y
+    fi
+    tasks_result
+}
+
+step_snap() {
+    is_yes "$SNAP" || return 0
+    have snap || return 0
+    tasks_reset
+    task "snaps" root snap refresh
+    tasks_result
+}
+
+step_firmware() {
+    local mode=${FIRMWARE,,}
+    [[ $mode == no ]] && return 0
+    have fwupdmgr || return 0
+    begin "fwupd"
+    root fwupdmgr refresh --force >/dev/null 2>&1
+    local rc
+    fwupdmgr get-updates --no-unreported-check >/dev/null 2>&1 </dev/null; rc=$?
+    if (( rc == 2 )); then good "Firmware is up to date."; result ok "up to date"; return 0; fi
+    if (( rc != 0 )); then warn "Could not check for firmware updates."; result warn "check failed"; return 0; fi
+
+    fwupdmgr get-updates --no-unreported-check </dev/null 2>/dev/null | sed 's/^/    /'
+    if [[ $mode == yes ]] || { ! is_yes "$NOCONFIRM" && confirm "Install firmware updates now?" n; }; then
+        local -a y=(); is_yes "$NOCONFIRM" && y=(-y)
+        if root fwupdmgr update --no-reboot-check "${y[@]}"; then
+            NEED_REBOOT+=("firmware")
+            result ok "firmware updated"
+        else
+            result fail "fwupdmgr update failed"
+        fi
+    else
+        result warn "updates available — run: fwupdmgr update"
+    fi
+}
+
+step_devtools() {
+    is_yes "$DEVTOOLS" || return 0
+    (( EUID != 0 )) || return 0
+    tasks_reset
+
+    if have rustup && rustup toolchain list 2>/dev/null | grep -qv 'no installed toolchains'; then
+        task "rustup toolchains" run rustup update
+    fi
+    have cargo-install-update && task "cargo crates" run cargo install-update -a
+    if have pipx && [[ -n $(pipx list --short 2>/dev/null) ]]; then
+        task "pipx apps" run pipx upgrade-all
+    fi
+    if have uv; then
+        [[ -n $(uv tool list 2>/dev/null | grep -v '^No tools') ]] && task "uv tools" run uv tool upgrade --all
+        # standalone installer leaves a receipt; pacman/pip installs cannot self-update
+        [[ -f ${XDG_CONFIG_HOME:-$HOME/.config}/uv/uv-receipt.json ]] && task "uv itself" run uv self update
+    fi
+    if have npm; then
+        local prefix
+        prefix=$(npm config get prefix 2>/dev/null)
+        # global packages under /usr belong to pacman — only touch a user-owned prefix
+        if [[ -n $prefix && $prefix != /usr && -w $prefix ]] \
+           && [[ -n $(npm ls -g --depth=0 --parseable 2>/dev/null | tail -n +2) ]]; then
+            task "npm globals" run npm update -g
+        fi
+    fi
+    [[ -x $HOME/.bun/bin/bun ]]   && task "bun"  run "$HOME/.bun/bin/bun" upgrade
+    [[ -x $HOME/.deno/bin/deno ]] && task "deno" run "$HOME/.deno/bin/deno" upgrade
+    if have gh && [[ -n $(gh extension list 2>/dev/null) ]]; then
+        task "gh extensions" run gh extension upgrade --all
+    fi
+    have tldr && task "tldr pages" run tldr --update
+    tasks_result
+}
+
+step_plugins() {
+    is_yes "$PLUGINS" || return 0
+    (( EUID != 0 )) || return 0
+    tasks_reset
+
+    local omz=${ZSH:-$HOME/.oh-my-zsh}
+    if have zsh && [[ -d $omz/.git && -w $omz && -f $omz/tools/upgrade.sh ]]; then
+        task "oh-my-zsh" run env ZSH="$omz" zsh -f "$omz/tools/upgrade.sh"
+    fi
+    if have fish && fish -c 'functions -q fisher' >/dev/null 2>&1; then
+        task "fisher (fish plugins)" run fish -c 'fisher update'
+    fi
+    local d
+    for d in "$HOME/.tmux/plugins/tpm" "${XDG_CONFIG_HOME:-$HOME/.config}/tmux/plugins/tpm"; do
+        if [[ -x $d/bin/update_plugins ]]; then task "tmux plugins (tpm)" run "$d/bin/update_plugins" all; break; fi
+    done
+    if have nvim && [[ -d ${XDG_DATA_HOME:-$HOME/.local/share}/nvim/lazy/lazy.nvim ]]; then
+        task "neovim plugins (lazy.nvim)" run nvim --headless '+Lazy! sync' +qa
+    fi
+    tasks_result
+}
+
+step_dotfiles() {
+    is_yes "$DOTFILES" || return 0
+    (( EUID != 0 )) || return 0
+    tasks_reset
+
+    # Caelestia (github.com/caelestia-dots) — only when its dots are installed
+    if have caelestia && [[ -f ${XDG_STATE_HOME:-$HOME/.local/state}/caelestia/dots-state.json ]]; then
+        local -a args=(update)
+        [[ $HELPER == @(paru|yay) ]] && args+=(--aur-helper "$HELPER")
+        is_yes "$NOCONFIRM" && args+=(--noconfirm)
+        task "Caelestia dotfiles" run caelestia "${args[@]}"
+    fi
+    tasks_result
+}
+
+step_extra() {
+    tasks_reset
+    export SYSUP_HELPER=$HELPER SYSUP_NOCONFIRM=$NOCONFIRM SYSUP_DRY_RUN=$DRY_RUN
+    local c h
+    for c in "${EXTRA_COMMANDS[@]}"; do
+        [[ -n $c ]] && task "$c" run bash -c "$c"
+    done
+    for h in "$CONFIG_DIR"/hooks.d/*; do
+        [[ -f $h && -x $h ]] && task "${h##*/}" run "$h"
+    done
+    tasks_result
+}
+
+clean_aur_cache() {
+    local cache=${XDG_CACHE_HOME:-$HOME/.cache} top dir base n_clones=0 n_builds=0
+    local -A installed=()
+    while IFS= read -r base; do installed[$base]=1; done < <(
+        sed -n '/^%BASE%$/{n;p}' /var/lib/pacman/local/*/desc 2>/dev/null)
+    local -a dirs=()
+    for top in "$cache/paru/clone" "$cache/yay"; do
+        [[ -d $top ]] || continue
+        for dir in "$top"/*/; do
+            dir=${dir%/}
+            [[ -f $dir/PKGBUILD ]] || continue
+            base=${dir##*/}
+            if [[ -z ${installed[$base]-} ]]; then
+                (( DRY_RUN )) || rm -rf -- "$dir"
+                (( n_clones++ ))
+                continue
+            fi
+            if [[ -d $dir/src || -d $dir/pkg ]]; then
+                (( DRY_RUN )) || rm -rf -- "$dir/src" "$dir/pkg"
+                (( n_builds++ ))
+            fi
+            dirs+=(-c "$dir")
+        done
+    done
+    local verb=removed; (( DRY_RUN )) && verb="would remove"
+    (( n_clones )) && info "$verb $n_clones build dir(s) of packages that are no longer installed"
+    (( n_builds )) && info "$verb leftover build trees in $n_builds package dir(s)"
+    if (( ${#dirs[@]} )) && have paccache; then
+        run paccache -rk1 "${dirs[@]}" >/dev/null 2>&1 || true
+    fi
+    return 0
+}
+
+clean_trash() {
+    local trash=${XDG_DATA_HOME:-$HOME/.local/share}/Trash info d epoch name n=0 cutoff
+    cutoff=$(( $(date +%s) - TRASH_MAX_AGE * 86400 ))
+    [[ -d $trash/info ]] || return 0
+    for info in "$trash"/info/*.trashinfo; do
+        d=$(sed -n 's/^DeletionDate=//p' "$info")
+        epoch=$(date -d "$d" +%s 2>/dev/null) || continue
+        (( epoch < cutoff )) || continue
+        name=${info##*/}; name=${name%.trashinfo}
+        (( DRY_RUN )) || rm -rf -- "$trash/files/$name" "$info"
+        (( n++ ))
+    done
+    if (( n )); then
+        (( DRY_RUN )) && info "would empty $n trash item(s)" || info "emptied $n trash item(s) older than $TRASH_MAX_AGE days"
+    fi
+}
+
+step_clean() {
+    is_yes "$CLEAN" || return 0
+    begin
+    tasks_reset
+    local before after freed
+    before=$(disk_used)
+
+    # orphans (pacman -Qdt never lists optional dependencies)
+    local -a orphans=()
+    if (( PKG_OK )) && [[ ${ORPHANS,,} != no ]]; then
+        mapfile -t orphans < <(pacman -Qdtq 2>/dev/null)
+        if (( ${#orphans[@]} )); then
+            info "${#orphans[@]} orphaned package(s):"
+            printf '%s\n' "${orphans[@]}" | column -c "${COLUMNS:-80}" 2>/dev/null | sed 's/^/      /'
+            if [[ ${ORPHANS,,} == yes ]] || confirm "Remove them?" y; then
+                task "orphans" root pacman -Rns --noconfirm "${orphans[@]}"
+            fi
+        fi
+    fi
+
+    if have paccache; then
+        task "package cache (keep $PKG_CACHE_KEEP)" root paccache -rk"$PKG_CACHE_KEEP"
+        task "cache of uninstalled packages"     root paccache -ruk"$PKG_CACHE_KEEP_UNINSTALLED"
+    fi
+    (( EUID != 0 )) && is_yes "$AUR_CACHE" && task "AUR build cache" clean_aur_cache
+    have journalctl && task "systemd journal" root journalctl --vacuum-size="$JOURNAL_MAX_SIZE" --vacuum-time="$JOURNAL_MAX_AGE"
+
+    local thumbs=${XDG_CACHE_HOME:-$HOME/.cache}/thumbnails n
+    if [[ -d $thumbs ]]; then
+        n=$(find "$thumbs" -type f -atime +"$THUMBNAIL_MAX_AGE" 2>/dev/null | wc -l)
+        (( n )) && task "old thumbnails ($n)" run find "$thumbs" -type f -atime +"$THUMBNAIL_MAX_AGE" -delete
+    fi
+
+    if is_yes "$DEEP_CLEAN"; then
+        info "${B}deep clean${R}"
+        have pip   && task "pip cache"  run pip cache purge
+        have uv    && task "uv cache"   run uv cache prune
+        have npm   && task "npm cache"  run npm cache clean --force
+        have yarn  && task "yarn cache" run yarn cache clean
+        have pnpm  && task "pnpm store" run pnpm store prune
+        have go    && task "go build cache" run go clean -cache
+        have cargo-cache && task "cargo cache" run cargo cache --autoclean
+        if have docker && docker info >/dev/null 2>&1; then
+            task "docker dangling images" run docker image prune -f
+            task "docker build cache"     run docker builder prune -f
+        fi
+        if have podman; then
+            task "podman dangling images" run podman image prune -f
+        fi
+        if [[ -d /var/lib/systemd/coredump ]] && [[ -n $(find /var/lib/systemd/coredump -type f -mtime +"$COREDUMP_MAX_AGE" -print -quit 2>/dev/null) ]]; then
+            task "old coredumps" root find /var/lib/systemd/coredump -type f -mtime +"$COREDUMP_MAX_AGE" -delete
+        fi
+        (( EUID != 0 )) && task "trash (older than $TRASH_MAX_AGE days)" clean_trash
+    fi
+
+    after=$(disk_used)
+    freed=$(( before - after ))
+    (( freed < 0 )) && freed=0
+    if (( DRY_RUN )); then
+        tasks_result "dry run, ${#TASK_OK[@]} task(s)"
+    else
+        good "Freed ${B}$(human "$freed")${R}"
+        tasks_result "freed $(human "$freed")"
+    fi
+}
+
+step_checks() {
+    is_yes "$CHECKS" || return 0
+    begin
+    local -a issues=() list=()
+    local p
+
+    # config files that need merging
+    if have pacdiff; then
+        mapfile -t list < <(pacdiff -o 2>/dev/null)
+        if (( ${#list[@]} )); then
+            warn "${#list[@]} config file(s) need merging:"
+            printf '      %s\n' "${list[@]}"
+            info "merge them with: ${B}pacdiff -s${R}  (set DIFFPROG to use your favourite diff tool)"
+            issues+=("${#list[@]} .pacnew/.pacsave")
+        fi
+    fi
+
+    # failed services
+    mapfile -t list < <(systemctl --failed --no-legend --plain 2>/dev/null | awk '{print $1}')
+    if (( EUID != 0 )); then
+        local -a ulist=()
+        mapfile -t ulist < <(systemctl --user --failed --no-legend --plain 2>/dev/null | awk '{print $1 " (user)"}')
+        list+=("${ulist[@]}")
+    fi
+    if (( ${#list[@]} )); then
+        warn "${#list[@]} failed service(s): $(join ', ' "${list[@]}")"
+        info "inspect with: ${B}systemctl status <unit>${R} / ${B}journalctl -xeu <unit>${R}"
+        issues+=("${#list[@]} failed unit(s)")
+    fi
+
+    # packages linked against old libraries (rebuild-detector)
+    if have checkrebuild; then
+        mapfile -t list < <(checkrebuild 2>/dev/null | awk '{print $2}')
+        if (( ${#list[@]} )); then
+            warn "${#list[@]} package(s) may need a rebuild: $(join ' ' "${list[@]}")"
+            [[ $HELPER == @(paru|yay) ]] && info "rebuild with: ${B}$HELPER -S --rebuild $(join ' ' "${list[@]}")${R}"
+            issues+=("${#list[@]} need rebuild")
+        fi
+    fi
+
+    # reboot needed?
+    [[ -d /usr/lib/modules/$(uname -r) ]] || NEED_REBOOT+=("kernel")
+    while IFS= read -r p; do
+        case $p in
+            linux-api-headers|*-headers|*-docs) ;;
+            linux|linux-*|*-ucode|systemd|glibc|nvidia|nvidia-*|mesa|dbus|dbus-broker|cryptsetup|btrfs-progs)
+                NEED_REBOOT+=("$p") ;;
+        esac
+    done < <(changed_packages)
+    if (( ${#NEED_REBOOT[@]} )); then
+        mapfile -t NEED_REBOOT < <(printf '%s\n' "${NEED_REBOOT[@]}" | awk '!seen[$0]++')
+        warn "Reboot recommended — updated: $(join ', ' "${NEED_REBOOT[@]}")"
+        issues+=("reboot recommended")
+    fi
+
+    # optimisation tips (not counted as problems)
+    if ! grep -qE '^[[:space:]]*ParallelDownloads' /etc/pacman.conf 2>/dev/null; then
+        TIPS+=("Enable ${B}ParallelDownloads = 5${R} in /etc/pacman.conf for much faster updates.")
+    fi
+    if lsblk -dno ROTA 2>/dev/null | grep -q '^ *0$' && ! systemctl is-enabled -q fstrim.timer 2>/dev/null; then
+        TIPS+=("You have an SSD but weekly TRIM is off: ${B}sudo systemctl enable --now fstrim.timer${R}")
+    fi
+    if ! have checkrebuild && [[ $HELPER != pacman ]]; then
+        TIPS+=("Install ${B}rebuild-detector${R} so sysup can spot AUR packages broken by library updates.")
+    fi
+
+    if (( ${#issues[@]} )); then result warn "$(join ', ' "${issues[@]}")"
+    else good "Everything looks healthy."; result ok "all good"; fi
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Summary
+# ─────────────────────────────────────────────────────────────────────────────
+summary() {
+    local s icon fails=0 warns=0 line
+    printf '\n%s' "$B"; rule; printf '%s' "$R"
+    printf '%s Summary%s\n' "$B" "$R"
+    for s in "${STEPS[@]}"; do
+        [[ -n ${STARTED[$s]-} ]] || continue
+        case ${STATUS[$s]:-ok} in
+            ok)   icon="$GRN$B$I_OK" ;;
+            warn) icon="$YLW$B$I_WARN"; (( warns++ )) ;;
+            fail) icon="$RED$B$I_FAIL"; (( fails++ )) ;;
+            *)    icon="$D$I_SKIP" ;;
+        esac
+        printf '  %s%s %-24s %s%s%s\n' "$icon" "$R" "${STEP_TITLE[$s]}" "$D" "${NOTE[$s]-}" "$R"
+    done
+
+    if (( ${#TIPS[@]} )); then
+        printf '\n%s Tips%s\n' "$B" "$R"
+        local t
+        for t in "${TIPS[@]}"; do printf '  %s%s%s %s\n' "$CYN" "$I_DOT" "$R" "$t"; done
+    fi
+
+    printf '\n'
+    line="Done in $(duration "$SECONDS")"
+    if (( fails )); then printf '  %s%s%s with %d problem(s)%s\n' "$RED$B" "$I_FAIL" " $line" "$fails" "$R"
+    else printf '  %s%s %s%s\n' "$GRN$B" "$I_OK" "$line" "$R"; fi
+    if (( ${#NEED_REBOOT[@]} )); then
+        printf '  %s%s Reboot recommended%s %s(%s)%s\n' "$YLW$B" "$I_WARN" "$R" "$D" "$(join ', ' "${NEED_REBOOT[@]}")" "$R"
+    fi
+
+    if (( ! DRY_RUN )) && (( EUID != 0 )) && mkdir -p "$STATE_DIR" 2>/dev/null; then
+        {
+            printf '%s  fails=%d warns=%d  ' "$(date -Is)" "$fails" "$warns"
+            for s in "${STEPS[@]}"; do [[ -n ${STARTED[$s]-} ]] && printf '%s=%s ' "$s" "${STATUS[$s]:-ok}"; done
+            printf '\n'
+        } >>"$STATE_DIR/history.log" 2>/dev/null
+    fi
+    return "$(( fails > 0 ))"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+main() {
+    CLI_SKIP=()
+    setup_ui
+    parse_args "$@"
+    load_config
+    setup_ui
+
+    (( LIST_STEPS )) && { list_steps; exit 0; }
+    (( EDIT_CONFIG )) && edit_config
+
+    trap on_exit EXIT
+    trap on_interrupt INT TERM
+
+    detect_sudo
+    detect_helper
+    banner
+
+    if (( CHECK_ONLY )); then
+        have pacman || die "pacman not found"
+        gather_updates
+        print_updates
+        local u
+        for u in "${REPO_UPDATES[@]}";    do printf '    %s\n' "${u/ -> / $I_ARR }"; done
+        for u in "${AUR_UPDATES[@]}";     do printf '    %s%s%s\n' "$MAG" "${u/ -> / $I_ARR }" "$R"; done
+        for u in "${FLATPAK_UPDATES[@]}"; do printf '    %s%s (flatpak)%s\n' "$CYN" "$u" "$R"; done
+        exit 0
+    fi
+
+    preflight
+    if step_selected packages || step_selected keyring; then
+        gather_updates
+        print_updates
+    fi
+    sudo_start
+
+    for CUR in "${STEPS[@]}"; do
+        step_selected "$CUR" || continue
+        "step_$CUR"
+    done
+    CUR=""
+
+    summary
+}
+
+main "$@"

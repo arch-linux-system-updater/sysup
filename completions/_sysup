@@ -1,0 +1,37 @@
+#compdef sysup
+
+_sysup_steps() {
+    local -a steps=(
+        'news:Arch news since your last upgrade'
+        'mirrors:refresh the mirrorlist'
+        'keyring:update archlinux-keyring first'
+        'packages:repo + AUR upgrade'
+        'flatpak:Flatpak apps and runtimes'
+        'snap:Snap packages'
+        'firmware:fwupd firmware'
+        'devtools:rustup, cargo, pipx, uv, npm, gh, tldr'
+        'plugins:oh-my-zsh, fisher, tpm, lazy.nvim'
+        'dotfiles:Caelestia and other dotfile frameworks'
+        'extra:your own commands and hooks'
+        'clean:remove junk and free disk space'
+        'checks:.pacnew, failed units, reboot needed'
+    )
+    _values -s , 'step' $steps
+}
+
+_arguments -s \
+    '(-y --yes)'{-y,--yes}'[never ask, pass --noconfirm to everything]' \
+    '(-n --dry-run)'{-n,--dry-run}'[show what would run, change nothing]' \
+    '(-c --check)'{-c,--check}'[only list available updates]' \
+    '(-d --deep)'{-d,--deep}'[deep clean]' \
+    '--devel[also rebuild -git/VCS AUR packages]' \
+    '--no-clean[skip the cleanup step]' \
+    '--only[run only these steps]:steps:_sysup_steps' \
+    '--skip[skip these steps]:steps:_sysup_steps' \
+    '--helper[force an AUR helper]:helper:(paru yay pikaur trizen pacman)' \
+    '(-l --list-steps)'{-l,--list-steps}'[list all steps]' \
+    '--config[read an extra config file]:file:_files' \
+    '--edit-config[open your config in $EDITOR]' \
+    '--no-color[disable colours]' \
+    '(- *)'{-h,--help}'[show help]' \
+    '(- *)'{-V,--version}'[show version]'
