@@ -20,8 +20,8 @@ optdepends=(
 )
 backup=('etc/sysup.conf')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
-# real checksum is filled in by `make aur` once the v$pkgver tag is on GitHub
-sha256sums=('SKIP')
+# checksum is updated by `make aur` after each vX.Y.Z tag is pushed
+sha256sums=('873cdaddc222e4ac3fee926b249cfa6c7686996efa4bfba64719d80c09ba409b')
 
 package() {
     cd "$pkgname-$pkgver"

@@ -27,6 +27,6 @@ pkgbase = sysup
 	optdepends = rebuild-detector: find AUR packages that need a rebuild after library updates
 	backup = etc/sysup.conf
 	source = sysup-1.0.0.tar.gz::https://github.com/arch-linux-system-updater/sysup/archive/refs/tags/v1.0.0.tar.gz
-	sha256sums = SKIP
+	sha256sums = 873cdaddc222e4ac3fee926b249cfa6c7686996efa4bfba64719d80c09ba409b
 
 pkgname = sysup
