@@ -11,7 +11,7 @@
 </div>
 
 ```bash
-paru -S sysup
+yay -S sysup / paru -S sysup
 sysup
 ```
 
